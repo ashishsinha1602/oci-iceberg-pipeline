@@ -91,6 +91,22 @@ def main():
     spark.sql(f"SELECT place, count(*) readings, round(avg(temperature_c), 2) avg_value "
               f"FROM {TABLE} GROUP BY place ORDER BY place").show(50, False)
 
+    # a one-file CSV anyone can open straight from the bucket, no Spark needed
+    try:
+        summary = spark.sql(f"""
+            SELECT place,
+                   count(*)                          AS readings,
+                   round(avg(temperature_c), 2)      AS avg_value,
+                   round(min(temperature_c), 2)      AS min_value,
+                   round(max(temperature_c), 2)      AS max_value,
+                   max(observed_at)                  AS last_seen
+              FROM {TABLE} GROUP BY place ORDER BY place""")
+        (summary.coalesce(1).write.mode("overwrite")
+                .option("header", "true").csv(f"{base}/query-results/latest-summary"))
+        print(f"[pipeline] summary CSV written to {base}/query-results/latest-summary", flush=True)
+    except Exception as e:  # noqa: BLE001  a convenience, never a reason to fail the job
+        print(f"[pipeline] summary CSV skipped: {type(e).__name__}: {e}", flush=True)
+
     # a plain Parquet copy, so SQL in the database can read it with no extra setup
     (spark.table(TABLE)
           .drop("raw")

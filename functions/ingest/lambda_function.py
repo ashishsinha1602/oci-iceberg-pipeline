@@ -10,6 +10,11 @@ What it needs (all from the environment, nothing hard-coded):
   SOURCE            openweather (default) | finnhub | openaq
   PLACES            comma-separated: cities for openweather, symbols for
                     finnhub, country codes for openaq
+  TRIGGER_DATAFLOW  1 (default) starts the Spark job as soon as the object is
+                    written, so the Iceberg table refreshes every run. Set to 0
+                    to leave the job to a schedule or to a hand-run.
+  DATAFLOW_APP      which Data Flow application to start. Default: the one whose
+                    name ends in -bronze-to-iceberg.
   BUCKET_LAKE       set by the sandbox: the bucket to write to
   OBJECT_NAMESPACE  set by the sandbox
 Each run writes one JSON-lines object under raw/dt=<date>/hh=<hour>/, so the
@@ -155,6 +160,41 @@ def object_storage():
         return oci.object_storage.ObjectStorageClient(cfg)
 
 
+def start_dataflow(run_id):
+    """Start the Spark job that turns the raw objects into the Iceberg table.
+
+    Nothing here names a tenancy: the compartment comes from the sandbox and the
+    application is found by name. A failure is logged, never raised - the data is
+    already safely written and the next run will pick it up.
+    """
+    compartment = os.environ.get("SANDBOX_COMPARTMENT_OCID")
+    if not compartment:
+        log("dataflow_skipped", reason="SANDBOX_COMPARTMENT_OCID not set")
+        return None
+    suffix = os.environ.get("DATAFLOW_APP", "-bronze-to-iceberg")
+    try:
+        signer = oci.auth.signers.get_resource_principals_signer()
+        client = oci.data_flow.DataFlowClient({}, signer=signer)
+    except Exception:  # noqa: BLE001  running on a laptop
+        client = oci.data_flow.DataFlowClient(oci.config.from_file())
+    apps = [a for a in client.list_applications(compartment_id=compartment).data
+            if a.display_name.endswith(suffix)]
+    if not apps:
+        log("dataflow_skipped", reason=f"no application ending in {suffix}")
+        return None
+    app = apps[0]
+    running = [r for r in client.list_runs(compartment_id=compartment, application_id=app.id).data
+               if r.lifecycle_state in ("ACCEPTED", "IN_PROGRESS")]
+    if running:
+        log("dataflow_skipped", reason="a run is already in progress", run=running[0].id[-12:])
+        return None
+    started = client.create_run(oci.data_flow.models.CreateRunDetails(
+        application_id=app.id, compartment_id=compartment,
+        display_name=f"bronze-to-iceberg {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M}")).data
+    log("dataflow_started", application=app.display_name, run=started.id[-12:], after_run=run_id)
+    return started.id
+
+
 def lambda_handler(event, context):
     started = time.time()
     run_id = uuid.uuid4().hex[:12]
@@ -181,9 +221,18 @@ def lambda_handler(event, context):
     key = f"raw/dt={now:%Y-%m-%d}/hh={now:%H}/{SOURCE}-{now:%Y%m%dT%H%M%S}-{run_id}.jsonl"
     object_storage().put_object(namespace, bucket, key, io.BytesIO(body), content_type="application/x-ndjson")
 
+    dataflow_run = None
+    if os.environ.get("TRIGGER_DATAFLOW", "1").strip() not in ("0", "false", "no"):
+        try:
+            dataflow_run = start_dataflow(run_id)
+        except Exception as e:  # noqa: BLE001  the data is written; never fail the ingest for this
+            log("dataflow_failed", error=str(e)[:250])
+
     took = round(time.time() - started, 2)
-    log("run_done", run_id=run_id, rows=len(rows), bytes=len(body), object=key, seconds=took)
-    return {"rows": len(rows), "object": key, "bucket": bucket, "seconds": took, "run_id": run_id}
+    log("run_done", run_id=run_id, rows=len(rows), bytes=len(body), object=key,
+        dataflow_run=(dataflow_run or "")[-12:], seconds=took)
+    return {"rows": len(rows), "object": key, "bucket": bucket, "seconds": took,
+            "run_id": run_id, "dataflow_run": dataflow_run}
 
 
 if __name__ == "__main__":                       # run it locally to check the key
